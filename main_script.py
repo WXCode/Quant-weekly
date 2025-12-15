@@ -127,26 +127,37 @@ def create_features(data, lags=5, window_sizes=[20, 50, 200]):
     final_features = combined.drop(columns=close_prices.columns)
     return final_features, final_close_prices
 
-# --- 3. Target Definition (Multi-day forward returns) ---
+# --- 3. Target Definition (Multi-day forward returns) ---  
 def create_target(close_prices, horizon=5):
     """
-    Define the target variable: will a stock outperform the median stock over the next `horizon` days?
-    This creates a classification problem (1 for outperform, 0 for underperform).
+    Define the target variable based on cross-sectional return ranks.
+    - Success (1): Stock is in the top 25 performers over the horizon.
+    - Fail (0): Stock is in the bottom 25 performers over the horizon.
+    - Middle stocks are masked (NaN) and ignored during training.
     """
     # Calculate forward returns
     forward_returns = close_prices.shift(-horizon) / close_prices - 1
     
-    # Define target: 1 if the stock's forward return is > 10%, else 0
-    target = (forward_returns > 0.10).astype(int)
+    # Create an empty target DataFrame with the same shape and index, filled with NaNs
+    target = pd.DataFrame(np.nan, index=forward_returns.index, columns=forward_returns.columns)
+    
+    # Get ranks for each day. `ascending=False` means smaller rank is better (higher return).
+    ranks = forward_returns.rank(axis=1, ascending=False, method='min')
+    
+    # Calculate the rank of the 25th worst stock for each day
+    bottom_rank_threshold = forward_returns.notna().sum(axis=1) - 24
+    
+    # Set target to 1 for top 25 stocks and 0 for bottom 25 stocks
+    target[ranks <= 25] = 1
+    target[ranks.ge(bottom_rank_threshold, axis=0)] = 0
     
     return target
 
 # --- 4. Backtesting Engine ---
 def run_backtest(predictions, close_prices, horizon=5, top_k=10):
     """
-    A simple vectorized backtest for a long/short portfolio.
+    A simple vectorized backtest for a long-only portfolio.
     - Go long the `top_k` stocks with the highest predicted probability.
-    - Go short the `top_k` stocks with the lowest predicted probability.
     """
     print("Running backtest...")
     # Align predictions with the price data for calculating returns
@@ -160,7 +171,6 @@ def run_backtest(predictions, close_prices, horizon=5, top_k=10):
     # So we use the prediction at `t` to calculate returns from `t`
     
     long_returns = pd.Series(0, index=predictions.index)
-    short_returns = pd.Series(0, index=predictions.index)
     
     # This loop simulates the rebalancing period (e.g., every `horizon` days)
     for i in range(0, len(predictions), horizon):
@@ -171,21 +181,17 @@ def run_backtest(predictions, close_prices, horizon=5, top_k=10):
         
         # Identify top and bottom k stocks
         long_candidates = daily_preds.nlargest(top_k).index
-        short_candidates = daily_preds.nsmallest(top_k).index
         
         # Calculate portfolio returns for the next `horizon` days
         # We assume equal weighting
         if date in returns.index:
             long_ret = returns.loc[date, long_candidates].mean()
-            short_ret = returns.loc[date, short_candidates].mean()
             
             # Store the single return for this period
             if i + horizon <= len(predictions):
                 long_returns.iloc[i:i+horizon] = long_ret / horizon
-                short_returns.iloc[i:i+horizon] = short_ret / horizon
 
-    # The strategy return is (longs - shorts) / 2 (since it's a dollar-neutral portfolio)
-    strategy_daily_returns = (long_returns - short_returns) / 2
+    strategy_daily_returns = long_returns
     
     return strategy_daily_returns.fillna(0)
 
@@ -384,7 +390,7 @@ def get_autoencoder_features_and_predictions(X_train, y_train, X_test, train_mod
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    encoding_dim = 32 # The size of our new "deep feature" vector
+    encoding_dim = 4 # The size of our new "deep feature" vector
     input_dim = X_train_scaled.shape[1]
     
     # Define model paths
@@ -398,7 +404,7 @@ def get_autoencoder_features_and_predictions(X_train, y_train, X_test, train_mod
         print("Building and training Autoencoder for feature generation...")
         # --- Define Autoencoder Model ---
         input_layer = tf.keras.layers.Input(shape=(input_dim,))
-        encoder = tf.keras.layers.Dense(1024, activation='relu')(input_layer)
+        encoder = tf.keras.layers.Dense(2048, activation='relu')(input_layer)
         encoder = tf.keras.layers.Dense(64, activation='relu')(encoder)
         encoder = tf.keras.layers.Dense(32, activation='relu')(encoder)
         encoder = tf.keras.layers.Dense(encoding_dim, activation='relu')(encoder)
@@ -406,12 +412,12 @@ def get_autoencoder_features_and_predictions(X_train, y_train, X_test, train_mod
         decoder = tf.keras.layers.Dense(32, activation='relu')(encoder)
         decoder = tf.keras.layers.Dense(64, activation='relu')(decoder)
 
-        decoder = tf.keras.layers.Dense(1024, activation='relu')(decoder)
+        decoder = tf.keras.layers.Dense(2048, activation='relu')(decoder)
         decoder = tf.keras.layers.Dense(input_dim, activation='linear')(decoder)
         autoencoder = tf.keras.Model(inputs=input_layer, outputs=decoder)
         autoencoder.compile(optimizer='adam', loss='mse')
         early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-        autoencoder.fit(X_train_scaled, X_train_scaled, epochs=100, batch_size=256, shuffle=True, validation_split=0.2, callbacks=[early_stopping], verbose=1)
+        autoencoder.fit(X_train_scaled, X_train_scaled, epochs=100, batch_size=16, shuffle=True, validation_split=0.2, callbacks=[early_stopping], verbose=1)
         autoencoder.save(autoencoder_path)
         print(f"Autoencoder saved to {autoencoder_path}")
     else:
@@ -480,7 +486,9 @@ def visualize_embeddings(embeddings, labels):
     plt.figure(figsize=(10, 7))
     sns.scatterplot(x="tsne-1", y="tsne-2", hue="label", palette=sns.color_palette("hls", 2), data=df, legend="full", alpha=0.6)
     plt.title("t-SNE Visualization of Autoencoder Embeddings (by Target Label)")
+    plt.savefig('tsne_embeddings.png')
     plt.show()
+    plt.close()
 
 def check_for_strong_signals(predictions, long_threshold=0.85, short_threshold=0.15):
     """Scans the latest predictions and prints alerts for strong signals."""
@@ -634,12 +642,24 @@ def main():
     if strategy_choice == 'gradient_boosting':
         # === Strategy 1: Gradient Boosting for Cross-Sectional Ranking ===
         print("Training Gradient Boosting model...")
-        model = lgb.LGBMClassifier(objective='binary', n_estimators=500, learning_rate=0.05, num_leaves=31, n_jobs=-1, random_state=42)
+        # A more tuned set of parameters for a harder classification problem
+        model = lgb.LGBMClassifier(
+            objective='binary',
+            n_estimators=1000,      # More trees for a harder problem
+            learning_rate=0.02,     # Lower learning rate to be more careful
+            num_leaves=41,          # Slightly more complex trees
+            reg_alpha=0.1,          # L1 regularization
+            reg_lambda=0.1,         # L2 regularization
+            colsample_bytree=0.8,   # Feature subsampling
+            subsample=0.8,          # Data subsampling
+            n_jobs=-1,
+            random_state=42
+        )
         model.fit(X_train, y_train)
         from sklearn.metrics import roc_auc_score
         train_preds_proba = model.predict_proba(X_train)[:, 1]
         fit_auc = roc_auc_score(y_train, train_preds_proba)
-        print(f"LGBM (on Autoencoder Features) Fit AUC: {fit_auc:.4f}")
+        print(f"LGBM (Gradient Boosting) Fit AUC: {fit_auc:.4f}")
         print("Generating predictions on test set...")
         predictions_flat = model.predict_proba(X_test)[:, 1]
         predictions = pd.Series(predictions_flat, index=X_test.index).unstack()
@@ -688,6 +708,5 @@ def main():
     
     plot_results(strategy_returns, benchmark_test_returns)
 
-# --- Main Execution Logic ---
 if __name__ == '__main__':
     main()
